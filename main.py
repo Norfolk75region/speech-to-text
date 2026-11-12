@@ -30,6 +30,7 @@ import ctranslate2
 from faster_whisper import WhisperModel, decode_audio
 
 from diarization import SAMPLE_RATE, Diarizer, SpeakerLookup
+from errors import UserError, explain, is_out_of_memory
 from formats import TextWriter, build_phrases, speaker_label, write_json, write_srt
 
 # Модели скачиваются в папку рядом со скриптом: так её можно целиком
@@ -158,11 +159,37 @@ class Transcriber:
         )
 
     def _switch_to_cpu(self, error: Exception) -> None:
-        print(f"\nНа видеокарте не получилось: {error}")
+        if is_out_of_memory(error):
+            print("\nВидеокарте не хватило памяти для этой модели.")
+        else:
+            print(f"\nНа видеокарте не получилось (причина: {error}).")
         print("Переключаюсь на процессор. Будет медленнее, но заработает.")
         self.device = "cpu"
         self.model = None
         self._load()
+
+    @staticmethod
+    def _read_audio(audio_path: Path):
+        """Достаёт звук из файла. Ошибки чтения объясняет простыми словами."""
+        no_sound = UserError(
+            "В этом файле нет звука: похоже, это видео без звуковой дорожки "
+            "или пустая запись."
+        )
+        try:
+            audio = decode_audio(str(audio_path), sampling_rate=SAMPLE_RATE)
+        except IndexError:
+            # Так декодер сообщает, что в файле нет звуковой дорожки.
+            raise no_sound from None
+        except (OSError, MemoryError):
+            raise  # нет доступа, файл пропал, мало памяти — объяснит explain()
+        except Exception as error:
+            raise UserError(
+                "Не получилось прочитать файл: это не аудио и не видео, либо он "
+                "повреждён или скопирован не до конца."
+            ) from error
+        if len(audio) == 0:
+            raise no_sound
+        return audio
 
     def transcribe(self, audio_path: Path, speakers: int, save_words: bool) -> None:
         """
@@ -171,7 +198,7 @@ class Transcriber:
         """
         print(f"\nРаспознаю: {audio_path.name}")
         started = time.monotonic()
-        audio = decode_audio(str(audio_path), sampling_rate=SAMPLE_RATE)
+        audio = self._read_audio(audio_path)
         duration = len(audio) / SAMPLE_RATE
         print(f"Длительность записи: {format_time(duration)}")
 
@@ -211,10 +238,12 @@ class Transcriber:
         if self.language is None:
             print(f"  Определён язык: {info.language}")
 
-        base = audio_path.with_name(audio_path.stem)
-        text_path = base.with_name(base.name + "_transcript.txt")
-        srt_path = base.with_suffix(".srt")
-        json_path = base.with_name(base.name + "_words.json")
+        # Имена собираем через with_name, а не with_suffix: в названии записи
+        # бывают точки («Встреча 12.11.2026»), и with_suffix отрезал бы хвост.
+        stem = audio_path.stem
+        text_path = audio_path.with_name(stem + "_transcript.txt")
+        srt_path = audio_path.with_name(stem + ".srt")
+        json_path = audio_path.with_name(stem + "_words.json")
 
         phrases = []
         with text_path.open("w", encoding="utf-8") as file:
@@ -401,7 +430,8 @@ def main() -> int:
             transcriber.transcribe(path, speakers, args.words)
         except Exception as error:
             failed += 1
-            print(f"\nНе удалось распознать {path.name}: {error}")
+            print(f"\nНе удалось распознать {path.name}.")
+            print(explain(error))
         if interactive:
             next_file = ask_file()
             if next_file is not None:
