@@ -1,12 +1,15 @@
 """
 Распознавание речи из аудио- и видеофайлов в текст (faster-whisper).
 
-Без аргументов скрипт работает в пошаговом режиме: спрашивает файл, модель
-и сколько человек говорит. С файлами в аргументах сразу распознаёт их:
+Без аргументов открывается меню: в окно можно перетащить файл, несколько
+файлов или папку, а ещё зайти в настройки (модель и язык по умолчанию,
+хранятся в settings.json) или запустить с другими параметрами на один раз.
+С файлами или папками в аргументах распознаёт их сразу:
 
     python main.py запись.m4a
     python main.py интервью.mp3 --speakers 2 --words
     python main.py лекция.mp4 --model small --device cpu --speakers 1
+    python main.py папка_с_записями
     python main.py --list-models
 
 Рядом с записью появляются <имя>_transcript.txt (текст с временем и говорящими),
@@ -15,6 +18,7 @@
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,11 +31,12 @@ from pathlib import Path
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 
 import ctranslate2
-from faster_whisper import WhisperModel, decode_audio
+from faster_whisper import WhisperModel, decode_audio, download_model
 
 from diarization import SAMPLE_RATE, Diarizer, SpeakerLookup
 from errors import UserError, explain, is_out_of_memory
 from formats import TextWriter, build_phrases, speaker_label, write_json, write_srt
+from settings import Settings, load_settings, save_settings
 
 # Модели скачиваются в папку рядом со скриптом: так её можно целиком
 # скопировать на компьютер без интернета.
@@ -54,6 +59,12 @@ MODELS = [
     ModelInfo("large-v3", "3 ГБ", "максимальная точность, самая медленная"),
 ]
 MODEL_NAMES = [model.name for model in MODELS]
+
+
+def is_model_downloaded(name: str) -> bool:
+    """Лежит ли модель в models/. Смотрим на сам файл весов: папка остаётся и от прерванной загрузки."""
+    pattern = f"models--*--faster-whisper-{name}/snapshots/*/model.bin"
+    return any(MODELS_DIR.glob(pattern))
 
 
 @dataclass
@@ -149,7 +160,7 @@ class Transcriber:
         compute_type = pick_compute_type(self.device)
         where = "видеокарте" if self.device == "cuda" else "процессоре"
         print(f"\nЗагружаю модель {self.model_name} на {where}...")
-        if not any(MODELS_DIR.glob(f"models--*--faster-whisper-{self.model_name}")):
+        if not is_model_downloaded(self.model_name):
             print("Модель скачивается из интернета в первый раз, это может занять несколько минут.")
         self.model = WhisperModel(
             self.model_name,
@@ -263,7 +274,86 @@ class Transcriber:
             print(f"Время каждого слова: {json_path}")
 
 
-# ---------- пошаговый режим ----------
+# ---------- файлы ----------
+
+# Что брать из папки. Файл, указанный напрямую, берём с любым расширением.
+MEDIA_EXTENSIONS = {
+    ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wma", ".amr", ".aiff",
+    ".mp4", ".mkv", ".mov", ".avi", ".webm", ".wmv", ".m4v", ".3gp", ".mpg", ".mpeg", ".ts", ".flv",
+}
+
+
+def split_dropped(raw: str) -> list[str]:
+    """
+    Разбирает строку, которая получается при перетаскивании в окно: один путь
+    или несколько через пробел. Пути с пробелами Windows берёт в кавычки,
+    а PowerShell ещё и ставит «& » в начале.
+    """
+    raw = raw.strip()
+    if raw.startswith("& "):
+        raw = raw[2:].strip()
+    if not raw:
+        return []
+    # Один путь, возможно с пробелами и без кавычек (набрали руками).
+    whole = raw.strip("\"'")
+    if Path(whole).exists():
+        return [whole]
+    parts = re.findall(r'"([^"]+)"|\'([^\']+)\'|(\S+)', raw)
+    paths = [next(filter(None, groups)) for groups in parts]
+    # Ни одного куска не существует — значит, это один неверный путь с пробелами,
+    # а не несколько файлов: не дробим его, чтобы не пугать списком обрывков.
+    if not any(Path(path).exists() for path in paths):
+        return [whole]
+    return paths
+
+
+def expand_paths(paths: list) -> tuple[list[Path], list[str]]:
+    """
+    Превращает файлы и папки в список файлов для распознавания.
+    Из папки берутся аудио и видео, вложенные папки не просматриваются.
+    Второе значение — что не так, простыми словами.
+    """
+    files: list[Path] = []
+    problems: list[str] = []
+    for path in map(Path, paths):
+        if path.is_file():
+            files.append(path)
+        elif path.is_dir():
+            inside = sorted(
+                item for item in path.iterdir()
+                if item.is_file() and item.suffix.lower() in MEDIA_EXTENSIONS
+            )
+            if inside:
+                files.extend(inside)
+            else:
+                problems.append(f"В папке нет аудио и видео: {path}")
+        else:
+            problems.append(f"Файл не найден: {path}")
+    return list(dict.fromkeys(files)), problems
+
+
+def read_files(raw: str) -> list[Path]:
+    """Файлы из строки, введённой в окне. Пустой список — что-то не нашлось, об этом уже сказано."""
+    files, problems = expand_paths(split_dropped(raw))
+    if problems:
+        for problem in problems:
+            print(problem)
+        print("Попробуйте ещё раз.")
+        return []
+    if len(files) > 1:
+        print(f"Файлов к распознаванию: {len(files)}")
+    return files
+
+
+# ---------- вопросы ----------
+
+LANGUAGES = {"ru": "русский", "en": "английский", "auto": "определять автоматически"}
+YES = {"д", "да", "y", "yes"}
+NO = {"н", "нет", "n", "no"}
+
+
+def language_title(code: str) -> str:
+    return LANGUAGES.get(code, code)
 
 
 def ask(prompt: str) -> str:
@@ -273,41 +363,37 @@ def ask(prompt: str) -> str:
         return ""
 
 
-def clean_dropped_path(raw: str) -> str:
-    """Убирает кавычки и «& », которые Windows добавляет при перетаскивании файла в окно."""
-    raw = raw.strip()
-    if raw.startswith("& "):
-        raw = raw[2:].strip()
-    return raw.strip("\"'")
-
-
-def ask_file() -> Path | None:
+def ask_yes(prompt: str, default: bool) -> bool:
     while True:
-        raw = ask(
-            "\nПеретащите аудио- или видеофайл в это окно и нажмите Enter\n"
-            "(или просто Enter, чтобы выйти): "
-        )
+        raw = ask(prompt).lower()
         if not raw:
-            return None
-        path = Path(clean_dropped_path(raw))
-        if path.is_file():
-            return path
-        print(f"Файл не найден: {path}. Попробуйте ещё раз.")
+            return default
+        if raw in YES:
+            return True
+        if raw in NO:
+            return False
+        print("Введите «да» или «нет».")
 
 
-def print_models(recommended: str) -> None:
+def print_models(recommended: str, current: str | None = None) -> None:
     print("\nДоступные модели (чем ниже, тем точнее, но медленнее и тяжелее):")
     for number, model in enumerate(MODELS, start=1):
-        mark = "  <- рекомендуется" if model.name == recommended else ""
-        print(f"  {number}. {model.name:<15} {model.size:>7}  {model.description}{mark}")
+        status = "скачана" if is_model_downloaded(model.name) else "не скачана"
+        marks = []
+        if model.name == current:
+            marks.append("выбрана")
+        if model.name == recommended:
+            marks.append("рекомендуется")
+        mark = f"  <- {', '.join(marks)}" if marks else ""
+        print(f"  {number}. {model.name:<15} {model.size:>7}  {status:<10}  {model.description}{mark}")
 
 
-def ask_model(recommended: str) -> str:
-    print_models(recommended)
+def ask_model(recommended: str, current: str) -> str:
+    print_models(recommended, current)
     while True:
-        raw = ask(f"\nВведите номер модели или нажмите Enter для «{recommended}»: ")
+        raw = ask(f"\nВведите номер модели или нажмите Enter для «{current}»: ")
         if not raw:
-            return recommended
+            return current
         if raw.isdigit() and 1 <= int(raw) <= len(MODELS):
             return MODELS[int(raw) - 1].name
         if raw in MODEL_NAMES:
@@ -315,11 +401,26 @@ def ask_model(recommended: str) -> str:
         print(f"Нужно число от 1 до {len(MODELS)}.")
 
 
-def ask_speakers() -> int:
+def ask_language(current: str) -> str:
+    codes = list(LANGUAGES)
+    print("\nЯзык записи:")
+    for number, code in enumerate(codes, start=1):
+        print(f"  {number}. {LANGUAGES[code]}")
+    while True:
+        raw = ask(f"\nВведите номер или нажмите Enter для «{language_title(current)}»: ")
+        if not raw:
+            return current
+        if raw.isdigit() and 1 <= int(raw) <= len(codes):
+            return codes[int(raw) - 1]
+        print(f"Нужно число от 1 до {len(codes)}.")
+
+
+def ask_speakers(file_count: int = 1) -> int:
     """0 — определить самому, 1 — один человек (говорящих не размечаем)."""
+    where = "в записи" if file_count == 1 else "в записях (одно число на все файлы)"
     while True:
         raw = ask(
-            "\nСколько человек говорит в записи? Введите число\n"
+            f"\nСколько человек говорит {where}? Введите число\n"
             "(или просто Enter, если не знаете, — программа определит сама): "
         )
         if not raw:
@@ -337,26 +438,161 @@ def speakers_arg(value: str) -> int:
     raise argparse.ArgumentTypeError("нужно число от 1 или auto")
 
 
+# ---------- настройки ----------
+
+
+def describe_choice(model_name: str, language: str) -> str:
+    status = "скачана" if is_model_downloaded(model_name) else "скачается при первом запуске"
+    return f"модель {model_name} ({status}), язык: {language_title(language)}"
+
+
+def download_everything(model_name: str) -> None:
+    """Скачивает модель распознавания и модели для определения говорящих."""
+    try:
+        if not is_model_downloaded(model_name):
+            size = next(model.size for model in MODELS if model.name == model_name)
+            print(f"\nСкачиваю модель {model_name} ({size}), это может занять несколько минут...")
+            download_model(model_name, cache_dir=str(MODELS_DIR))
+        Diarizer(MODELS_DIR).download_all()
+    except Exception as error:
+        print("\nСкачать не получилось.")
+        print(explain(error))
+        return
+    print("\nВсё нужное скачано: дальше программа работает без интернета.")
+
+
+def store(settings: Settings) -> None:
+    if not save_settings(settings):
+        print(
+            "Не получилось сохранить настройки: в папку с программой нельзя записывать. "
+            "Они действуют, пока открыто это окно."
+        )
+
+
+def settings_menu(settings: Settings, hardware: Hardware, recommended: str) -> None:
+    while True:
+        model_name = settings.model or recommended
+        ready = is_model_downloaded(model_name) and Diarizer(MODELS_DIR).is_downloaded()
+        print("\n--- Настройки по умолчанию ---")
+        print(f"Компьютер: {hardware.describe()}")
+        print(f"  1. Модель: {model_name} ({'скачана' if is_model_downloaded(model_name) else 'не скачана'})")
+        print(f"  2. Язык записи: {language_title(settings.language)}")
+        print(f"  3. Скачать всё для работы без интернета{' (уже скачано)' if ready else ''}")
+        raw = ask("\nВведите номер или нажмите Enter, чтобы вернуться: ")
+        if not raw:
+            return
+        if raw == "1":
+            settings.model = ask_model(recommended, model_name)
+            store(settings)
+            if not is_model_downloaded(settings.model) and ask_yes(
+                "Эта модель ещё не скачана. Скачать сейчас? (Enter — да, «нет» — позже): ", True
+            ):
+                download_everything(settings.model)
+        elif raw == "2":
+            settings.language = ask_language(settings.language)
+            store(settings)
+        elif raw == "3":
+            download_everything(model_name)
+        else:
+            print("Нужно число от 1 до 3.")
+
+
 # ---------- запуск ----------
+
+
+class Session:
+    """Распознаёт пачки файлов и держит загруженную модель между ними."""
+
+    def __init__(self, device: str):
+        self.device = device
+        self.transcriber: Transcriber | None = None
+
+    def run(self, files: list[Path], model_name: str, language: str,
+            speakers: int, save_words: bool) -> int:
+        """Возвращает, сколько файлов распознать не удалось."""
+        if self.transcriber is None or self.transcriber.model_name != model_name:
+            self.transcriber = Transcriber(model_name, self.device, None)
+        self.transcriber.language = None if language == "auto" else language
+
+        failed = 0
+        for path in files:
+            try:
+                self.transcriber.transcribe(path, speakers, save_words)
+            except Exception as error:
+                failed += 1
+                print(f"\nНе удалось распознать {path.name}.")
+                print(explain(error))
+        if len(files) > 1:
+            print(f"\nРаспознано файлов: {len(files) - failed} из {len(files)}.")
+        return failed
+
+
+def main_menu(session: Session, settings: Settings, hardware: Hardware,
+              recommended: str, args: argparse.Namespace) -> int:
+    """Главный экран: перетащили файл — распознаём с настройками по умолчанию."""
+    failed = 0
+    while True:
+        # Параметры из командной строки важнее сохранённых настроек.
+        model_name = args.model or settings.model or recommended
+        language = args.language or settings.language
+        save_words = args.words
+
+        print(f"\nСейчас: {describe_choice(model_name, language)}")
+        raw = ask(
+            "\nПеретащите в это окно файл, несколько файлов или папку и нажмите Enter.\n"
+            "Или введите: 1 — настройки, 2 — запуск с другими параметрами, Enter — выход\n"
+            "> "
+        )
+        if not raw:
+            return failed
+        if raw == "1":
+            settings_menu(settings, hardware, recommended)
+            continue
+        if raw == "2":
+            raw = ask(
+                "\nПеретащите файл, несколько файлов или папку и нажмите Enter\n"
+                "(или просто Enter, чтобы вернуться): "
+            )
+            files = read_files(raw) if raw else []
+            if not files:
+                continue
+            print("\nЭти параметры действуют один раз, настройки по умолчанию не меняются.")
+            model_name = ask_model(recommended, model_name)
+            language = ask_language(language)
+            save_words = ask_yes(
+                "\nСохранить время каждого слова в отдельный файл? (Enter — нет, «да» — сохранить): ",
+                False,
+            )
+        else:
+            files = read_files(raw)
+            if not files:
+                continue
+
+        speakers = args.speakers if args.speakers is not None else ask_speakers(len(files))
+        failed += session.run(files, model_name, language, speakers, save_words)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Переводит речь из аудио- или видеофайла в текст. "
-                    "Без аргументов запускается пошаговый режим с вопросами.",
+                    "Без аргументов открывается меню с настройками.",
     )
-    parser.add_argument("files", nargs="*", type=Path, help="аудио- или видеофайлы")
+    parser.add_argument(
+        "files", nargs="*", type=Path,
+        help="аудио- или видеофайлы; из папки берутся все записи",
+    )
     parser.add_argument(
         "-m", "--model", choices=MODEL_NAMES,
-        help="модель распознавания (по умолчанию подбирается под компьютер)",
+        help="модель распознавания (по умолчанию из настроек или под компьютер)",
     )
     parser.add_argument(
         "-d", "--device", choices=["auto", "cuda", "cpu"], default="auto",
         help="на чём считать: видеокарта (cuda), процессор (cpu) или auto",
     )
     parser.add_argument(
-        "-l", "--language", default="ru",
-        help="язык записи: ru, en и т. д., или auto для автоопределения (по умолчанию ru)",
+        "-l", "--language",
+        help="язык записи: ru, en и т. д., или auto для автоопределения "
+             "(по умолчанию из настроек, изначально ru)",
     )
     parser.add_argument(
         "-s", "--speakers", type=speakers_arg,
@@ -376,10 +612,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     hardware = detect_hardware()
+    settings = load_settings(MODEL_NAMES)
 
     if args.list_models:
         print(f"Компьютер: {hardware.describe()}")
-        print_models(hardware.recommended_model())
+        print_models(hardware.recommended_model(), settings.model)
         return 0
 
     print("=== Распознавание речи в текст ===")
@@ -389,55 +626,29 @@ def main() -> int:
     if device == "cuda" and not hardware.has_gpu:
         print("Видеокарта NVIDIA не найдена, поэтому работаю на процессоре.")
         device = "cpu"
-    language = None if args.language == "auto" else args.language
-
-    interactive = not args.files
-    files = list(args.files)
-    missing = [path for path in files if not path.is_file()]
-    if missing:
-        for path in missing:
-            print(f"Файл не найден: {path}")
-        return 1
-
-    if interactive:
-        first = ask_file()
-        if first is None:
-            return 0
-        files = [first]
-
-    # Модель спрашиваем, только если человек сидит у окна и не указал её сам.
     recommended = "small" if device == "cpu" else hardware.recommended_model()
-    if args.model:
-        model_name = args.model
-    elif sys.stdin.isatty():
-        model_name = ask_model(recommended)
-    else:
-        model_name = recommended
+    session = Session(device)
 
-    # Число говорящих: из аргумента; в пошаговом режиме — для каждого файла;
-    # при перетаскивании файлов на run.bat — один раз на все.
-    can_ask = sys.stdin.isatty()
-    batch_speakers = args.speakers
-    if batch_speakers is None and not interactive:
-        batch_speakers = ask_speakers() if can_ask else 0
+    if not args.files:
+        return 1 if main_menu(session, settings, hardware, recommended, args) else 0
 
-    transcriber = Transcriber(model_name, device, language)
-    failed = 0
-    while files:
-        path = files.pop(0)
-        speakers = batch_speakers if batch_speakers is not None else ask_speakers()
-        try:
-            transcriber.transcribe(path, speakers, args.words)
-        except Exception as error:
-            failed += 1
-            print(f"\nНе удалось распознать {path.name}.")
-            print(explain(error))
-        if interactive:
-            next_file = ask_file()
-            if next_file is not None:
-                files.append(next_file)
+    # Файлы переданы сразу (например, их перетащили на run.bat): меню не показываем,
+    # берём настройки по умолчанию и спрашиваем только число говорящих.
+    files, problems = expand_paths(args.files)
+    if problems:
+        for problem in problems:
+            print(problem)
+        return 1
+    model_name = args.model or settings.model or recommended
+    language = args.language or settings.language
+    print(f"Сейчас: {describe_choice(model_name, language)}")
+    if len(files) > 1:
+        print(f"Файлов к распознаванию: {len(files)}")
 
-    return 1 if failed else 0
+    speakers = args.speakers
+    if speakers is None:
+        speakers = ask_speakers(len(files)) if sys.stdin.isatty() else 0
+    return 1 if session.run(files, model_name, language, speakers, args.words) else 0
 
 
 if __name__ == "__main__":

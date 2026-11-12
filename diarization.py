@@ -27,6 +27,7 @@ import sherpa_onnx
 RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
 SEGMENTATION_URL = f"{RELEASES}/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
 SEGMENTATION_MEMBER = "sherpa-onnx-pyannote-segmentation-3-0/model.onnx"
+SEGMENTATION_FILE = "pyannote-segmentation-3.0.onnx"  # под этим именем храним у себя
 # Да, в названии релиза опечатка («recongition») — так у авторов.
 EMBEDDINGS_URL = f"{RELEASES}/speaker-recongition-models"
 KNOWN_COUNT_EMBEDDING = "nemo_en_titanet_small.onnx"  # 40 МБ
@@ -70,8 +71,19 @@ class Diarizer:
         self.directory = models_dir / "diarization"
         self.threads = min(8, os.cpu_count() or 1)
 
+    def is_downloaded(self) -> bool:
+        """Все ли три модели уже лежат на диске."""
+        names = (SEGMENTATION_FILE, KNOWN_COUNT_EMBEDDING, AUTO_EMBEDDING)
+        return all((self.directory / name).exists() for name in names)
+
+    def download_all(self) -> None:
+        """Скачивает все модели заранее, чтобы потом работать без интернета."""
+        self._segmentation()
+        self._embedding(KNOWN_COUNT_EMBEDDING)
+        self._embedding(AUTO_EMBEDDING)
+
     def _segmentation(self) -> Path:
-        path = self.directory / "pyannote-segmentation-3.0.onnx"
+        path = self.directory / SEGMENTATION_FILE
         if path.exists():
             return path
         self.directory.mkdir(parents=True, exist_ok=True)
