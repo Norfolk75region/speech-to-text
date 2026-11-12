@@ -1,12 +1,16 @@
 """
 Распознавание речи из аудио- и видеофайлов в текст (faster-whisper).
 
-Без аргументов скрипт работает в пошаговом режиме: спрашивает файл и модель.
-С файлами в аргументах сразу распознаёт их:
+Без аргументов скрипт работает в пошаговом режиме: спрашивает файл, модель
+и сколько человек говорит. С файлами в аргументах сразу распознаёт их:
 
     python main.py запись.m4a
-    python main.py лекция.mp4 интервью.mp3 --model small --device cpu
+    python main.py интервью.mp3 --speakers 2 --words
+    python main.py лекция.mp4 --model small --device cpu --speakers 1
     python main.py --list-models
+
+Рядом с записью появляются <имя>_transcript.txt (текст с временем и говорящими),
+<имя>.srt (субтитры) и с --words <имя>_words.json (время каждого слова).
 """
 
 import argparse
@@ -23,7 +27,10 @@ from pathlib import Path
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 
 import ctranslate2
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, decode_audio
+
+from diarization import SAMPLE_RATE, Diarizer, SpeakerLookup
+from formats import TextWriter, build_phrases, speaker_label, write_json, write_srt
 
 # Модели скачиваются в папку рядом со скриптом: так её можно целиком
 # скопировать на компьютер без интернета.
@@ -135,6 +142,7 @@ class Transcriber:
         self.device = device
         self.language = language
         self.model: WhisperModel | None = None
+        self.diarizer: Diarizer | None = None
 
     def _load(self) -> None:
         compute_type = pick_compute_type(self.device)
@@ -156,46 +164,74 @@ class Transcriber:
         self.model = None
         self._load()
 
-    def transcribe(self, audio_path: Path) -> Path:
+    def transcribe(self, audio_path: Path, speakers: int, save_words: bool) -> None:
+        """
+        speakers: 0 — определить число говорящих самому, 1 — не определять,
+        2 и больше — столько человек в записи.
+        """
+        print(f"\nРаспознаю: {audio_path.name}")
+        started = time.monotonic()
+        audio = decode_audio(str(audio_path), sampling_rate=SAMPLE_RATE)
+        duration = len(audio) / SAMPLE_RATE
+        print(f"Длительность записи: {format_time(duration)}")
+
+        lookup = None
+        if speakers != 1:
+            if self.diarizer is None:
+                self.diarizer = Diarizer(MODELS_DIR)
+            turns = self.diarizer.run(audio, speakers or None)
+            found = len({turn.speaker for turn in turns})
+            print(f"  Найдено говорящих: {found}")
+            lookup = SpeakerLookup(turns)
+
         try:
             if self.model is None:
                 self._load()
-            return self._run(audio_path)
+            self._run(audio_path, audio, duration, lookup, save_words)
         except RuntimeError as error:
             # Например, не хватило видеопамяти или нет нужных библиотек CUDA.
             if self.device != "cuda":
                 raise
             self._switch_to_cpu(error)
-            return self._run(audio_path)
+            self._run(audio_path, audio, duration, lookup, save_words)
 
-    def _run(self, audio_path: Path) -> Path:
-        print(f"\nРаспознаю: {audio_path.name}")
-        started = time.monotonic()
+        print(f"\nГотово за {format_time(time.monotonic() - started)}.")
+
+    def _run(self, audio_path: Path, audio, duration: float,
+             lookup: SpeakerLookup | None, save_words: bool) -> None:
+        print("  Перевожу речь в текст...")
         segments, info = self.model.transcribe(
-            str(audio_path),
+            audio,
             language=self.language,
             beam_size=5,
             vad_filter=True,
+            # Время слов нужно, чтобы разрезать фразу, если в ней сменился говорящий.
+            word_timestamps=lookup is not None or save_words,
         )
-        duration = info.duration or 0
-        print(f"Длительность записи: {format_time(duration)}")
         if self.language is None:
-            print(f"Определён язык: {info.language}")
+            print(f"  Определён язык: {info.language}")
 
-        output_path = audio_path.with_name(audio_path.stem + "_transcript.txt")
-        with output_path.open("w", encoding="utf-8") as file:
-            for segment in segments:
-                text = segment.text.strip()
-                if not text:
-                    continue
-                file.write(text + "\n")
-                percent = min(100, segment.end / duration * 100) if duration else 0
-                print(f"[{percent:3.0f}%] {text}")
+        base = audio_path.with_name(audio_path.stem)
+        text_path = base.with_name(base.name + "_transcript.txt")
+        srt_path = base.with_suffix(".srt")
+        json_path = base.with_name(base.name + "_words.json")
 
-        elapsed = time.monotonic() - started
-        print(f"\nГотово за {format_time(elapsed)}.")
-        print(f"Текст сохранён в файл: {output_path}")
-        return output_path
+        phrases = []
+        with text_path.open("w", encoding="utf-8") as file:
+            writer = TextWriter(file)
+            for phrase in build_phrases(segments, lookup):
+                phrases.append(phrase)
+                writer.write(phrase)
+                percent = min(100, phrase.end / duration * 100) if duration else 0
+                who = f"{speaker_label(phrase.speaker)}: " if phrase.speaker is not None else ""
+                print(f"[{percent:3.0f}%] {who}{phrase.text}")
+
+        write_srt(srt_path, phrases)
+        print(f"\nТекст: {text_path}")
+        print(f"Субтитры: {srt_path}")
+        if save_words:
+            write_json(json_path, phrases, info.language, duration)
+            print(f"Время каждого слова: {json_path}")
 
 
 # ---------- пошаговый режим ----------
@@ -250,6 +286,28 @@ def ask_model(recommended: str) -> str:
         print(f"Нужно число от 1 до {len(MODELS)}.")
 
 
+def ask_speakers() -> int:
+    """0 — определить самому, 1 — один человек (говорящих не размечаем)."""
+    while True:
+        raw = ask(
+            "\nСколько человек говорит в записи? Введите число\n"
+            "(или просто Enter, если не знаете, — программа определит сама): "
+        )
+        if not raw:
+            return 0
+        if raw.isdigit() and int(raw) >= 1:
+            return int(raw)
+        print("Нужно число: 1, 2, 3 и так далее.")
+
+
+def speakers_arg(value: str) -> int:
+    if value == "auto":
+        return 0
+    if value.isdigit() and int(value) >= 1:
+        return int(value)
+    raise argparse.ArgumentTypeError("нужно число от 1 или auto")
+
+
 # ---------- запуск ----------
 
 
@@ -270,6 +328,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-l", "--language", default="ru",
         help="язык записи: ru, en и т. д., или auto для автоопределения (по умолчанию ru)",
+    )
+    parser.add_argument(
+        "-s", "--speakers", type=speakers_arg,
+        help="сколько человек говорит: число, auto — определить самому, "
+             "1 — не размечать говорящих (без параметра спросит или определит сам)",
+    )
+    parser.add_argument(
+        "-w", "--words", action="store_true",
+        help="дополнительно сохранить время каждого слова в <имя>_words.json",
     )
     parser.add_argument(
         "--list-models", action="store_true", help="показать список моделей и выйти",
@@ -318,12 +385,20 @@ def main() -> int:
     else:
         model_name = recommended
 
+    # Число говорящих: из аргумента; в пошаговом режиме — для каждого файла;
+    # при перетаскивании файлов на run.bat — один раз на все.
+    can_ask = sys.stdin.isatty()
+    batch_speakers = args.speakers
+    if batch_speakers is None and not interactive:
+        batch_speakers = ask_speakers() if can_ask else 0
+
     transcriber = Transcriber(model_name, device, language)
     failed = 0
     while files:
         path = files.pop(0)
+        speakers = batch_speakers if batch_speakers is not None else ask_speakers()
         try:
-            transcriber.transcribe(path)
+            transcriber.transcribe(path, speakers, args.words)
         except Exception as error:
             failed += 1
             print(f"\nНе удалось распознать {path.name}: {error}")
