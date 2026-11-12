@@ -1,0 +1,5 @@
+# Версии проверены вместе. av 19 ломает faster-whisper 1.2.1
+# (av.open() больше не принимает metadata_errors).
+faster-whisper==1.2.1
+av==18.0.0
+ctranslate2==4.8.3
