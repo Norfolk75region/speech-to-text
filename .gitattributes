@@ -5,3 +5,9 @@
 *.bat text eol=crlf
 *.ps1 text eol=crlf
 *.txt text eol=crlf
+
+# Этим файлам в архиве для пользователей делать нечего: они нужны только
+# для разработки. В репозитории остаются, в ZIP не попадают.
+CLAUDE.md export-ignore
+.gitignore export-ignore
+.gitattributes export-ignore
