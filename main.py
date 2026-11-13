@@ -14,6 +14,7 @@
 
 Рядом с записью появляются <имя>_transcript.txt (текст с временем и говорящими),
 <имя>.srt (субтитры) и с --words <имя>_words.json (время каждого слова).
+С --output результаты пишутся в указанную папку, с --srt-only — только субтитры.
 """
 
 import argparse
@@ -31,11 +32,12 @@ from pathlib import Path
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 
 import ctranslate2
-from faster_whisper import WhisperModel, decode_audio, download_model
+from faster_whisper import BatchedInferencePipeline, WhisperModel, decode_audio, download_model
 
+from chunking import plan_chunks
 from diarization import SAMPLE_RATE, Diarizer, SpeakerLookup
 from errors import UserError, explain, is_out_of_memory
-from formats import TextWriter, build_phrases, speaker_label, write_json, write_srt
+from formats import TextWriter, build_phrases, drop_invented, speaker_label, write_json, write_srt
 from settings import Settings, load_settings, save_settings
 
 # Модели скачиваются в папку рядом со скриптом: так её можно целиком
@@ -137,6 +139,29 @@ def pick_compute_type(device: str) -> str:
     return "default"
 
 
+# Образец текста, который модель видит перед каждым куском записи. Смысл не важен,
+# важен вид: предложения с заглавной буквы, точки, запятые. Для остальных языков
+# подсказки нет — модель пишет как умеет.
+STYLE_PROMPTS = {
+    "ru": "Здравствуйте. Итак, начнём: это запись разговора, с правильной пунктуацией и заглавными буквами.",
+    "en": "Hello. Let's begin: this is a recording, with proper punctuation and capital letters.",
+}
+
+# Сколько кусков записи распознавать за один проход. На видеокарте так заметно
+# быстрее; большая модель с четырьмя кусками помещается в 4 ГБ видеопамяти.
+BATCH_SIZE = {"cuda": 4, "cpu": 2}
+
+
+@dataclass(frozen=True)
+class Options:
+    """Что делать с записями, кроме модели и языка."""
+
+    speakers: int = 0                # 0 — определить самому, 1 — не определять, иначе число людей
+    save_words: bool = False         # писать <имя>_words.json
+    output_dir: Path | None = None   # куда класть результаты; None — рядом с записью
+    srt_only: bool = False           # только субтитры, без <имя>_transcript.txt
+
+
 def format_time(seconds: float) -> str:
     seconds = int(seconds)
     hours, rest = divmod(seconds, 3600)
@@ -202,11 +227,7 @@ class Transcriber:
             raise no_sound
         return audio
 
-    def transcribe(self, audio_path: Path, speakers: int, save_words: bool) -> None:
-        """
-        speakers: 0 — определить число говорящих самому, 1 — не определять,
-        2 и больше — столько человек в записи.
-        """
+    def transcribe(self, audio_path: Path, options: Options) -> None:
         print(f"\nРаспознаю: {audio_path.name}")
         started = time.monotonic()
         audio = self._read_audio(audio_path)
@@ -214,10 +235,10 @@ class Transcriber:
         print(f"Длительность записи: {format_time(duration)}")
 
         lookup = None
-        if speakers != 1:
+        if options.speakers != 1:
             if self.diarizer is None:
                 self.diarizer = Diarizer(MODELS_DIR)
-            turns = self.diarizer.run(audio, speakers or None)
+            turns = self.diarizer.run(audio, options.speakers or None)
             found = len({turn.speaker for turn in turns})
             print(f"  Найдено говорящих: {found}")
             lookup = SpeakerLookup(turns)
@@ -225,51 +246,81 @@ class Transcriber:
         try:
             if self.model is None:
                 self._load()
-            self._run(audio_path, audio, duration, lookup, save_words)
+            self._run(audio_path, audio, duration, lookup, options)
         except RuntimeError as error:
             # Например, не хватило видеопамяти или нет нужных библиотек CUDA.
             if self.device != "cuda":
                 raise
             self._switch_to_cpu(error)
-            self._run(audio_path, audio, duration, lookup, save_words)
+            self._run(audio_path, audio, duration, lookup, options)
 
         print(f"\nГотово за {format_time(time.monotonic() - started)}.")
 
     def _run(self, audio_path: Path, audio, duration: float,
-             lookup: SpeakerLookup | None, save_words: bool) -> None:
+             lookup: SpeakerLookup | None, options: Options) -> None:
         print("  Перевожу речь в текст...")
-        segments, info = self.model.transcribe(
-            audio,
-            language=self.language,
-            beam_size=5,
-            vad_filter=True,
-            # Время слов нужно, чтобы разрезать фразу, если в ней сменился говорящий.
-            word_timestamps=lookup is not None or save_words,
-        )
-        if self.language is None:
-            print(f"  Определён язык: {info.language}")
+        # Запись режем на куски по паузам и распознаём их независимо: если идти
+        # по длинной записи подряд, модель начинает повторять фразы и теряет пунктуацию.
+        chunks = plan_chunks(audio)
+        if not chunks:
+            raise UserError("В этой записи не слышно речи: только тишина, шум или музыка.")
 
-        # Имена собираем через with_name, а не with_suffix: в названии записи
+        language = self.language
+        if language is None:
+            # Язык определяем по первому куску с речью, а не по началу файла: там бывает музыка.
+            first = audio[int(chunks[0].start * SAMPLE_RATE):int(chunks[0].end * SAMPLE_RATE)]
+            language = self.model.detect_language(first)[0]
+            print(f"  Определён язык: {language}")
+
+        segments, info = BatchedInferencePipeline(self.model).transcribe(
+            audio,
+            language=language,
+            beam_size=5,
+            batch_size=BATCH_SIZE[self.device],
+            vad_filter=False,
+            clip_timestamps=[{"start": chunk.start, "end": chunk.end} for chunk in chunks],
+            # Подсказка задаёт стиль каждому куску: без неё модель через раз
+            # пишет сплошной текст без точек и заглавных букв.
+            initial_prompt=STYLE_PROMPTS.get(language),
+            # Время слов нужно всегда: по нему собираются предложения и субтитры,
+            # а при разметке говорящих — режутся реплики.
+            word_timestamps=True,
+        )
+
+        # Имена собираем из stem, а не через with_suffix: в названии записи
         # бывают точки («Встреча 12.11.2026»), и with_suffix отрезал бы хвост.
+        folder = options.output_dir or audio_path.parent
+        folder.mkdir(parents=True, exist_ok=True)
         stem = audio_path.stem
-        text_path = audio_path.with_name(stem + "_transcript.txt")
-        srt_path = audio_path.with_name(stem + ".srt")
-        json_path = audio_path.with_name(stem + "_words.json")
+        text_path = folder / (stem + "_transcript.txt")
+        srt_path = folder / (stem + ".srt")
+        json_path = folder / (stem + "_words.json")
 
         phrases = []
-        with text_path.open("w", encoding="utf-8") as file:
-            writer = TextWriter(file)
-            for phrase in build_phrases(segments, lookup):
+        dropped = []
+        file = None if options.srt_only else text_path.open("w", encoding="utf-8")
+        try:
+            writer = TextWriter(file) if file else None
+            for phrase in drop_invented(build_phrases(segments, lookup), dropped):
                 phrases.append(phrase)
-                writer.write(phrase)
+                if writer:
+                    writer.write(phrase)
                 percent = min(100, phrase.end / duration * 100) if duration else 0
                 who = f"{speaker_label(phrase.speaker)}: " if phrase.speaker is not None else ""
                 print(f"[{percent:3.0f}%] {who}{phrase.text}")
+        finally:
+            if file:
+                file.close()
 
         write_srt(srt_path, phrases)
-        print(f"\nТекст: {text_path}")
+        print()
+        for phrase in dropped:
+            print("Убрана фраза, которую модель, скорее всего, придумала сама: "
+                  f"[{format_time(phrase.start)}] {phrase.text}")
+        if not options.srt_only:
+            print(f"Текст: {text_path}")
         print(f"Субтитры: {srt_path}")
-        if save_words:
+        if options.save_words:
             write_json(json_path, phrases, info.language, duration)
             print(f"Время каждого слова: {json_path}")
 
@@ -507,8 +558,7 @@ class Session:
         self.device = device
         self.transcriber: Transcriber | None = None
 
-    def run(self, files: list[Path], model_name: str, language: str,
-            speakers: int, save_words: bool) -> int:
+    def run(self, files: list[Path], model_name: str, language: str, options: Options) -> int:
         """Возвращает, сколько файлов распознать не удалось."""
         if self.transcriber is None or self.transcriber.model_name != model_name:
             self.transcriber = Transcriber(model_name, self.device, None)
@@ -517,7 +567,7 @@ class Session:
         failed = 0
         for path in files:
             try:
-                self.transcriber.transcribe(path, speakers, save_words)
+                self.transcriber.transcribe(path, options)
             except Exception as error:
                 failed += 1
                 print(f"\nНе удалось распознать {path.name}.")
@@ -569,7 +619,8 @@ def main_menu(session: Session, settings: Settings, hardware: Hardware,
                 continue
 
         speakers = args.speakers if args.speakers is not None else ask_speakers(len(files))
-        failed += session.run(files, model_name, language, speakers, save_words)
+        options = Options(speakers, save_words, args.output, args.srt_only)
+        failed += session.run(files, model_name, language, options)
 
 
 def parse_args() -> argparse.Namespace:
@@ -602,6 +653,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-w", "--words", action="store_true",
         help="дополнительно сохранить время каждого слова в <имя>_words.json",
+    )
+    parser.add_argument(
+        "-o", "--output", type=Path, metavar="ПАПКА",
+        help="папка для результатов (по умолчанию они ложатся рядом с записью)",
+    )
+    parser.add_argument(
+        "--srt-only", action="store_true",
+        help="писать только субтитры, без <имя>_transcript.txt",
     )
     parser.add_argument(
         "--list-models", action="store_true", help="показать список моделей и выйти",
@@ -648,7 +707,8 @@ def main() -> int:
     speakers = args.speakers
     if speakers is None:
         speakers = ask_speakers(len(files)) if sys.stdin.isatty() else 0
-    return 1 if session.run(files, model_name, language, speakers, args.words) else 0
+    options = Options(speakers, args.words, args.output, args.srt_only)
+    return 1 if session.run(files, model_name, language, options) else 0
 
 
 if __name__ == "__main__":
